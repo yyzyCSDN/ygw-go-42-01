@@ -64,29 +64,31 @@ func (r *Registry) Register(svc string, inst *model.Instance) uint64 {
 // RegisterSeq registers an instance carrying an explicit sequence number. A
 // stale retry (older sequence than the current registration) is rejected so a
 // late duplicate cannot roll back newer state.
+//
+// Registration advances monotonically by sequence number: only a write whose
+// seq is strictly greater than the currently recorded sequence is applied. A
+// retried registration that timed out and arrives after a newer registration
+// carries an older seq, so it is rejected instead of overwriting the newer
+// version/address. The recorded sequence is never rolled back, so the
+// registry keeps a single authoritative notion of which write is the latest.
 func (r *Registry) RegisterSeq(svc string, inst *model.Instance, seq uint64) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	// BUG(06): the sequence comparison is dropped, so a retried
-	// registration carrying an older sequence overwrites the newer state
-	// and the instance rolls back to a previous version or address. The
-	// retry path never validates that it is newer than the current
-	// registration, so a late duplicate wins over the original. Clients
-	// that discovered the newer endpoint are now routed at an address
-	// that was superseded, and the registry silently forgets the newer
-	// registration.
-	// The sequence bookkeeping still advances, so the registry thinks
-	// the stale write is the latest one.
-	// There is no ordering guard left, so any later stale retry can
-	// roll the endpoint back a second time.
-	// Ordering is entirely at the mercy of arrival timing.
-	// The registry cannot tell which write is authoritative anymore.
+	// Reject a stale retry: a sequence that is not strictly newer than the
+	// current one belongs to an earlier registration that already lost the
+	// race to a newer write. Applying it would roll the version and address
+	// back to the old values and revert the recorded sequence, so a late
+	// duplicate would silently win over the original.
+	if cur, ok := r.seqs[inst.ID]; ok && seq <= cur {
+		return false
+	}
 	if r.byService[svc] == nil {
 		r.byService[svc] = make(map[string]*model.Instance)
 	}
 	if r.services[svc] == nil {
 		r.services[svc] = model.NewService(svc)
 	}
+	delete(r.deleted, inst.ID)
 	r.instances[inst.ID] = inst
 	r.byService[svc][inst.ID] = inst
 	r.seqs[inst.ID] = seq
