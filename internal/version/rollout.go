@@ -18,13 +18,12 @@ func (r *Rollout) Start(service, newVersion string, weight int) {
 }
 
 // Finish deactivates the old version and keeps only the new one.
+// Deactivation bumps the store's revision; routers read the latest
+// snapshot on each route and refresh their per-service cache when the
+// revision changes, so subsequent routes stop sending traffic to the
+// deactivated version without needing an explicit cache invalidation.
 func (r *Rollout) Finish(service, oldVersion string) {
 	r.store.Deactivate(service, oldVersion)
-	// BUG(01b): deactivation only updates the version store; it never
-	// invalidates the per-service snapshot caches that routers hold, so
-	// already-routing consumers keep serving the old active set until a
-	// full restart. The revision counter moves but nothing consumes it
-	// to drop the cached view.
 }
 
 // Rollback reactivates the old version.

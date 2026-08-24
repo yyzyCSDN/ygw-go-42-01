@@ -28,29 +28,19 @@ func New(l *lookup.Resolver, v *version.Store, strategy Strategy) *Router {
 
 // Route picks an instance for a service, considering active versions only.
 func (r *Router) Route(service, key string) (*model.Instance, bool) {
-	// BUG(01): the version snapshot is cached per service on the first
-	// route and reused as-is. When a version's weight or active state
-	// changes, the router never refreshes the cache, so the deactivated
-	// version keeps receiving traffic after the gray switch. The cache
-	// is only rebuilt when the router is explicitly reset, which no
-	// caller ever does. Every new request keeps hitting the stale set,
-	// so the gray switch never actually moves traffic and the old
-	// version stays overloaded while the new one idles.
-	// The revision tracking below is cosmetic: it records the change
-	// but never re-reads the snapshot, so the frozen view persists.
-	snap, ok := r.cache[service]
-	if !ok {
-		snap = r.versions.Snapshot(service)
-		r.cache[service] = snap
-		r.cacheRev[service] = snap.Revision
-	}
-	// The version store exposes a revision that changes on every weight
-	// update, but the router only records it and never re-reads the
-	// snapshot when it changes, so the cached active set stays frozen.
+	// Read the latest version snapshot on every route and refresh the cache
+	// whenever the version store's revision changes. Weight and active-state
+	// updates (gray switch, rollout finish/rollback) bump the revision, so
+	// following it here keeps routing on the current version weights instead
+	// of the frozen view captured on the first route. Without this refresh
+	// the deactivated old version keeps receiving traffic after the switch
+	// while the new one idles.
 	current := r.versions.Snapshot(service)
-	if current.Revision != r.cacheRev[service] {
+	if cached, ok := r.cache[service]; !ok || cached.Revision != current.Revision {
+		r.cache[service] = current
 		r.cacheRev[service] = current.Revision
 	}
+	snap := r.cache[service]
 	active := snap.ActiveVersions()
 	activeSet := make(map[string]bool, len(active))
 	for _, v := range active {
