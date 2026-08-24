@@ -9,45 +9,66 @@ import (
 	"time"
 
 	"svcregistry/internal/model"
+	"svcregistry/internal/persist"
 )
 
 // errDeleted is returned when an in-flight registration targets a deleted id.
 var errDeleted = errors.New("registry: instance was deleted")
 
 // Registry is the in-process source of truth for services and instances.
+// A registration is only confirmed once its instance record (and its lease,
+// persisted alongside it) has been fsynced to disk; the confirmation is
+// never returned before that durability barrier succeeds.
 type Registry struct {
 	mu         sync.RWMutex
 	services   map[string]*model.Service
 	instances  map[string]*model.Instance
 	byService  map[string]map[string]*model.Instance
 	confirmed  map[string]bool
-	durableLog map[string]bool
 	inflight   map[string]int
 	seqs       map[string]uint64
 	deleted    map[string]bool
+	persister  persist.Persister
 }
 
-// New creates an empty registry.
+// New creates an empty registry backed by an in-memory (non-durable)
+// persister. Use NewWithPersister when crash-safe durability is required.
 func New() *Registry {
+	return NewWithPersister(persist.NewNop())
+}
+
+// NewWithPersister creates a registry that gates registration confirmations
+// on the given persister's durability barrier.
+func NewWithPersister(p persist.Persister) *Registry {
 	return &Registry{
-		services:   make(map[string]*model.Service),
-		instances:  make(map[string]*model.Instance),
+		services:  make(map[string]*model.Service),
+		instances: make(map[string]*model.Instance),
 		byService:  make(map[string]map[string]*model.Instance),
-		confirmed:  make(map[string]bool),
-		durableLog: make(map[string]bool),
-		inflight:   make(map[string]int),
-		seqs:       make(map[string]uint64),
-		deleted:    make(map[string]bool),
+		confirmed: make(map[string]bool),
+		inflight:  make(map[string]int),
+		seqs:      make(map[string]uint64),
+		deleted:   make(map[string]bool),
+		persister: p,
 	}
 }
 
+// Persister returns the durability barrier the registry confirms against.
+func (r *Registry) Persister() persist.Persister {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.persister
+}
+
 // Register adds an instance to the registry under its service. The instance is
-// recorded as an unconfirmed intent until ConfirmDurable is called. A fresh
+// recorded as an unconfirmed intent: it is staged in the durability log but
+// not yet confirmed to the caller. Confirmation only happens once
+// ConfirmDurable fsyncs both the instance record and its lease (staged
+// separately via the lease store) and reports success — so the success
+// acknowledgement never outruns the data a crash would lose. A fresh
 // registration clears any previous delete marker for the id. The returned
 // sequence number lets stale retries be rejected.
 func (r *Registry) Register(svc string, inst *model.Instance) uint64 {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	delete(r.deleted, inst.ID)
 	s := r.services[svc]
 	if s == nil {
@@ -60,18 +81,21 @@ func (r *Registry) Register(svc string, inst *model.Instance) uint64 {
 	r.instances[inst.ID] = inst
 	r.byService[svc][inst.ID] = inst
 	r.seqs[inst.ID]++
-	// BUG(02): the registration is confirmed immediately, before the
-	// instance and its lease have been persisted, and the durable record
-	// is written into a side log that nothing ever flushes to disk. A
-	// crash right after Register loses the endpoint even though the
-	// caller already received a success confirmation, and the durable
-	// side log is empty on restart. Discovery then returns nothing for
-	// a service that was just confirmed, and the caller keeps sending
-	// traffic to an endpoint the registry no longer knows about.
-	// The durable side log is only ever written, never replayed, so
-	// the divergence is permanent until the process is restarted.
-	r.confirmed[inst.ID] = true
-	r.durableLog[inst.ID] = true
+	// This is now an unconfirmed intent: deliberately NOT confirmed here.
+	// Stage the registration intent so ConfirmDurable can fsync it (and the
+	// lease staged alongside it) before the caller is told it succeeded.
+	r.confirmed[inst.ID] = false
+	persister := r.persister
+	r.mu.Unlock()
+
+	if persister != nil {
+		persister.Append(persist.Record{
+			Kind:       persist.KindRegister,
+			InstanceID: inst.ID,
+			Service:    svc,
+			Instance:   inst,
+		})
+	}
 	return r.seqs[inst.ID]
 }
 
@@ -124,14 +148,33 @@ func (r *Registry) RegisterInflight(svc string, inst *model.Instance) error {
 	return nil
 }
 
-// ConfirmDurable marks an instance registration as durably committed.
+// ConfirmDurable is the durability barrier for a registration. It fsyncs the
+// instance record together with any lease staged for the same instance, and
+// only then marks the registration confirmed. The caller must not
+// acknowledge success to its own caller before this returns true, so the
+// confirmation can never outrun the data a crash would lose. It returns
+// false when the instance is unknown or the durability barrier failed.
 func (r *Registry) ConfirmDurable(instanceID string) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if r.instances[instanceID] == nil {
+		r.mu.Unlock()
 		return false
 	}
+	persister := r.persister
+	r.mu.Unlock()
+
+	// Commit the staged instance + lease intents to stable storage before
+	// telling the caller the registration succeeded. A failure here must
+	// leave the registration unconfirmed.
+	if persister != nil {
+		if err := persister.Commit(instanceID); err != nil {
+			return false
+		}
+	}
+
+	r.mu.Lock()
 	r.confirmed[instanceID] = true
+	r.mu.Unlock()
 	return true
 }
 
@@ -140,6 +183,50 @@ func (r *Registry) Confirmed(instanceID string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.confirmed[instanceID]
+}
+
+// Recover replays the durability log and rebuilds registry state from the
+// committed records. Only fsynced (committed) intents are applied; an
+// intent that was staged but never committed is discarded, which is the
+// property callers rely on: state they were never told succeeded does not
+// reappear after a crash. Instance records are restored confirmed, since a
+// committed record is by definition one whose confirmation was earned.
+// Lease records are returned to the caller so the lease store can rebuild
+// its table from the same replay (call lease.Store.Recover with them).
+func (r *Registry) Recover() ([]persist.Record, error) {
+	if r.persister == nil {
+		return nil, nil
+	}
+	records, err := r.persister.Replay()
+	if err != nil {
+		return nil, err
+	}
+	var leases []persist.Record
+	r.mu.Lock()
+	for _, rec := range records {
+		switch rec.Kind {
+		case persist.KindRegister:
+			if rec.Instance == nil {
+				continue
+			}
+			inst := rec.Instance
+			if r.services[rec.Service] == nil {
+				r.services[rec.Service] = model.NewService(rec.Service)
+			}
+			if r.byService[rec.Service] == nil {
+				r.byService[rec.Service] = make(map[string]*model.Instance)
+			}
+			r.instances[inst.ID] = inst
+			r.byService[rec.Service][inst.ID] = inst
+			r.seqs[inst.ID]++
+			// A replayed registration was committed, therefore confirmed.
+			r.confirmed[inst.ID] = true
+		case persist.KindLease:
+			leases = append(leases, rec)
+		}
+	}
+	r.mu.Unlock()
+	return leases, nil
 }
 
 // Ack records an acknowledgement time for an instance.
