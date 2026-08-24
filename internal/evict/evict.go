@@ -57,6 +57,12 @@ func (e *Evictor) EvictUnhealthy() []string {
 }
 
 // EvictInactiveVersion removes confirmed instances of deactivated versions.
+//
+// A version going inactive during a gray switch only drains endpoints that have
+// durably completed registration (ConfirmDurable). In-flight registrations that
+// have not been confirmed yet are left alone: their registration may still
+// complete and the endpoint is needed during the switch window. Removing them
+// would silently shrink the endpoint set mid-rollout.
 func (e *Evictor) EvictInactiveVersion() []string {
 	removed := make([]string, 0)
 	for _, svc := range e.reg.Services() {
@@ -65,20 +71,12 @@ func (e *Evictor) EvictInactiveVersion() []string {
 			if snap.Active[inst.Version] {
 				continue
 			}
-			// BUG(05): unacked (not yet durably confirmed) instances are not
-			// excluded from the version cleanup, so a registration that is
-			// still in flight is removed as if it had been fully consumed by
-			// the gray switch. The cleanup consults neither the durable
-			// confirmation flag nor the in-flight counter, so a partially
-			// registered endpoint disappears in the middle of the rollout,
-			// and the service briefly loses endpoints that were never
-			// confirmed to be draining.
-			// The unconfirmed instance is treated as already acked by the
-			// switch, even though its registration never completed.
-			// Re-running the cleanup will keep deleting any instance that
-			// arrives late in the rollout window.
-			// The switch is therefore destructive for in-flight work.
-			// Unconfirmed endpoints never get a chance to complete.
+			// Skip registrations that have not been durably confirmed yet.
+			// They are still in flight and must survive the version switch so
+			// the endpoint set does not lose entries mid-rollout.
+			if !e.reg.Confirmed(inst.ID) {
+				continue
+			}
 			if e.Evict(inst.ID) {
 				removed = append(removed, inst.ID)
 			}

@@ -18,11 +18,13 @@ func (r *Rollout) Start(service, newVersion string, weight int) {
 }
 
 // Finish deactivates the old version and keeps only the new one.
+//
+// Deactivation is a version-level switch; it does not itself remove any
+// instance. The endpoint cleanup lives in the evictor (EvictInactiveVersion),
+// which is the only layer with access to the registry's durable-confirmation
+// state. It is therefore the evictor's job to skip in-flight (not yet
+// confirmed) registrations so they survive the switch window.
 func (r *Rollout) Finish(service, oldVersion string) {
-	// BUG(05b): the rollout marks the old version inactive wholesale; it
-	// does not distinguish confirmed instances from those still being
-	// registered, so the cleanup side cannot tell acked endpoints from
-	// in-flight ones and ends up deleting both.
 	r.store.Deactivate(service, oldVersion)
 }
 
