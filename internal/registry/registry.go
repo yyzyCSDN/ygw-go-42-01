@@ -82,27 +82,17 @@ func (r *Registry) RegisterSeq(svc string, inst *model.Instance, seq uint64) boo
 	return true
 }
 
-// RegisterContext registers an instance unless the context was cancelled.
+// RegisterContext registers an instance unless the context is already
+// cancelled. The cancellation is checked before any mutation so a cancelled
+// registration leaves no trace in the registry: no service entry, no
+// instance, no cleared delete marker, and nothing for discovery to return.
+// A non-nil error is therefore only ever returned together with an untouched
+// registry, so callers can treat it as "this registration did not happen".
 func (r *Registry) RegisterContext(ctx context.Context, svc string, inst *model.Instance) error {
-	// BUG(03): the instance is published to the registry before the
-	// cancellation is checked. A cancelled registration therefore leaves a
-	// half-written instance behind, the service table gains a partial
-	// endpoint with no metadata or lease, and discovery keeps returning
-	// it to callers. The publish step below runs unconditionally and the
-	// cancellation only changes the returned error. Callers then dial an
-	// address that was never fully registered and the half-written
-	// endpoint lingers until a manual cleanup.
-	// The cancellation context is checked after the fact, so the damage
-	// is already done by the time the error surfaces.
-	// Discovery keeps serving the partial endpoint across retries and
-	// no further signal ever removes it.
-	// The registration is half-written and half-acknowledged at once.
-	// A retry of the same cancelled registration repeats the leak.
-	// Only a restart clears the leftover entry.
-	r.Register(svc, inst)
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	r.Register(svc, inst)
 	return nil
 }
 
